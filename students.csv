@@ -1,0 +1,6 @@
+key,value
+student001,"{""Name"": ""Alice"", ""Age"": 15, ""Grade"": 10, ""Class"": ""A"", ""Subjects"": [""Math"", ""Science""]}"
+student002,"{""Name"": ""Bob"", ""Age"": 16, ""Grade"": 11, ""Class"": ""B"", ""Subjects"": [""English"", ""History""]}"
+student003,"{""Name"": ""Charlie"", ""Age"": 15, ""Grade"": 10, ""Class"": ""A"", ""Subjects"": [""Math"", ""Art""]}"
+
+
