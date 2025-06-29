@@ -6,10 +6,13 @@ import threading
 import tempfile
 import time
 import re
+import shutil
+import subprocess
 from collections import defaultdict
 from threading import Timer
 from contextlib import contextmanager
 from copy import deepcopy
+from pathlib import Path
 
 class BTreeNode:
     def __init__(self, leaf=True):
@@ -18,8 +21,11 @@ class BTreeNode:
         self.leaf = leaf
 
 class SimpleDB:
-    def __init__(self, db_file='database.json'):
-        self.db_file = db_file
+    def __init__(self, db_file='database.json', files_dir='files'):
+        self.db_file = Path(db_file)
+        self.files_dir = Path(files_dir)
+        self.db_file.parent.mkdir(parents=True, exist_ok=True)
+        self.files_dir.mkdir(parents=True, exist_ok=True)
         self.store = {}
         self.value_index = defaultdict(list)
         self.inverted_index = defaultdict(list)
@@ -88,7 +94,7 @@ class SimpleDB:
             raise TimeoutError("Timeout acquiring lock for load")
         try:
             print("Debug: Entering load method")
-            if os.path.exists(self.db_file):
+            if self.db_file.exists():
                 try:
                     with self.timeout(5):
                         print("Debug: Opening database file for reading")
@@ -122,16 +128,16 @@ class SimpleDB:
             raise TimeoutError("Timeout acquiring lock for save")
         try:
             print("Debug: Entering save method")
-            db_dir = os.path.dirname(self.db_file) or '.'
+            db_dir = str(self.db_file.parent)
             if not os.access(db_dir, os.W_OK):
                 print(f"Error: No write permission for directory {db_dir}")
                 raise PermissionError(f"No write permission for directory {db_dir}")
-            if os.path.exists(self.db_file) and not os.access(self.db_file, os.W_OK):
+            if self.db_file.exists() and not os.access(self.db_file, os.W_OK):
                 print(f"Error: No write permission for {self.db_file}")
                 raise PermissionError(f"No write permission for {self.db_file}")
             try:
-                if os.path.exists(self.db_file) and os.path.getsize(self.db_file) > 0:
-                    backup_file = self.db_file + '.bak'
+                if self.db_file.exists() and self.db_file.stat().st_size > 0:
+                    backup_file = str(self.db_file) + '.bak'
                     with self.timeout(5):
                         print("Debug: Creating backup")
                         with open(self.db_file, 'r') as src, open(backup_file, 'w') as dst:
@@ -302,6 +308,9 @@ class SimpleDB:
                 for op, key, old_value in self.transaction_log:
                     if op == "create":
                         if key in self.store:
+                            value = self.store[key]
+                            if isinstance(value, dict) and "file_path" in value and os.path.exists(value["file_path"]):
+                                os.remove(value["file_path"])
                             del self.store[key]
                             value_key = json.dumps(old_value, sort_keys=True) if old_value is not None else None
                             if value_key and key in self.value_index[value_key]:
@@ -322,6 +331,12 @@ class SimpleDB:
                     elif op == "delete":
                         self.store[key] = old_value
                         self.rebuild_indices()
+                    elif op == "upload":
+                        if key in self.store and isinstance(self.store[key], dict) and "file_path" in self.store[key]:
+                            if os.path.exists(self.store[key]["file_path"]):
+                                os.remove(self.store[key]["file_path"])
+                            del self.store[key]["file_path"]
+                            self.rebuild_indices()
                 self.transaction_log = []
                 self.transaction_active = False
                 print("Debug: Transaction rolled back")
@@ -406,6 +421,70 @@ class SimpleDB:
                 return f"Error exporting CSV: {e}"
         finally:
             print("Debug: Releasing lock for export_csv")
+            self.lock.release()
+
+    def upload(self, key, file_path):
+        print("Debug: Attempting to acquire lock for upload")
+        if not self.lock.acquire(timeout=5):
+            print("Error: Timeout acquiring lock for upload")
+            raise TimeoutError("Timeout acquiring lock for upload")
+        try:
+            print(f"Debug: Uploading file for key '{key}'")
+            if not self.current_user or self.current_role != "admin":
+                return "Error: Admin privileges required to upload files"
+            if key not in self.store:
+                return f"Error: Key '{key}' not found."
+            if not os.path.exists(file_path):
+                return f"Error: File '{file_path}' not found."
+            allowed_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.pdf', '.doc', '.docx'}
+            file_ext = os.path.splitext(file_path)[1].lower()
+            if file_ext not in allowed_extensions:
+                return f"Error: Unsupported file type. Allowed: {', '.join(allowed_extensions)}"
+            file_size = os.path.getsize(file_path)
+            if file_size > 10 * 1024 * 1024:  # 10MB limit
+                return "Error: File size exceeds 10MB limit"
+            dest_filename = f"{key}_{os.path.basename(file_path)}"
+            dest_path = self.files_dir / dest_filename
+            shutil.copy(file_path, dest_path)
+            if self.transaction_active:
+                self.transaction_log.append(("upload", key, None))
+                print(f"Debug: Added upload operation to transaction log for {key}")
+            self.store[key]["file_path"] = str(dest_path)
+            if not self.transaction_active:
+                print("Debug: Calling save method")
+                self.save()
+            print(f"Debug: Uploaded file for {key}: {dest_path}")
+            return f"Uploaded file for {key}: {dest_path}"
+        finally:
+            print("Debug: Releasing lock for upload")
+            self.lock.release()
+
+    def get_file(self, key):
+        print("Debug: Attempting to acquire lock for get_file")
+        if not self.lock.acquire(timeout=5):
+            print("Error: Timeout acquiring lock for get_file")
+            raise TimeoutError("Timeout acquiring lock for get_file")
+        try:
+            print(f"Debug: Retrieving file for key '{key}'")
+            if not self.current_user:
+                return "Error: Must be logged in to access files"
+            if key not in self.store:
+                return f"Error: Key '{key}' not found."
+            if "file_path" not in self.store[key]:
+                return f"Error: No file associated with key '{key}'."
+            file_path = self.store[key]["file_path"]
+            if not os.path.exists(file_path):
+                return f"Error: File '{file_path}' not found on disk."
+            try:
+                if os.name == 'nt':  # Windows
+                    subprocess.run(['start', '', file_path], shell=True, check=True)
+                elif os.name == 'posix':  # Linux/macOS
+                    subprocess.run(['xdg-open', file_path], check=True)
+                return f"Opened file: {file_path}"
+            except Exception as e:
+                return f"File path: {file_path} (Open manually due to error: {e})"
+        finally:
+            print("Debug: Releasing lock for get_file")
             self.lock.release()
 
     def parse_value(self, value):
@@ -507,6 +586,8 @@ class SimpleDB:
                 return f"Error: Key '{key}' not found."
             old_value = deepcopy(self.store[key])
             parsed_value = self.parse_value(value)
+            if isinstance(old_value, dict) and "file_path" in old_value:
+                parsed_value["file_path"] = old_value["file_path"]
             if self.transaction_active:
                 self.transaction_log.append(("update", key, old_value))
                 print(f"Debug: Added update operation to transaction log for {key}")
@@ -569,6 +650,9 @@ class SimpleDB:
                 if self.transaction_active:
                     self.transaction_log.append(("delete", key, value))
                     print(f"Debug: Added delete operation to transaction log for {key}")
+                if isinstance(value, dict) and "file_path" in value and os.path.exists(value["file_path"]):
+                    os.remove(value["file_path"])
+                    print(f"Debug: Deleted file {value['file_path']}")
                 del self.store[key]
                 print(f"Debug: Removed key '{key}' from store")
                 if key in self.value_index[value_key]:
@@ -852,6 +936,8 @@ def main():
     print("  - logout                     : Log out from the database (e.g., logout)")
     print("\nData Operations:")
     print("  - create <key> <value>    : Insert a new key-value pair (e.g., create student001 \"{\\\"Name\\\": \\\"Alice\\\", \\\"Age\\\": 15, \\\"Grade\\\": 10, \\\"Class\\\": \\\"A\\\", \\\"Subjects\\\": [\\\"Math\\\", \\\"Science\\\"]}\")")
+    print("  - upload <key> <file_path> : Upload a file for a key (admin only, e.g., upload student001 photo.jpg)")
+    print("  - get_file <key>          : Retrieve/open the file for a key (e.g., get_file student001)")
     print("  - read <key>              : Retrieve the value for a key (e.g., read student001)")
     print("  - update <key> <value>    : Update the value for an existing key (e.g., update student001 \"{\\\"Name\\\": \\\"Alice\\\", \\\"Age\\\": 16, \\\"Grade\\\": 10, \\\"Class\\\": \\\"A\\\", \\\"Subjects\\\": [\\\"Math\\\", \\\"Science\\\"]}\")")
     print("  - delete <key>            : Delete a key-value pair (admin only, e.g., delete student001)")
@@ -883,7 +969,7 @@ def main():
     print("  - exit                    : Exit the database CLI")
     print("\nNotes:")
     print("  - Must log in to perform operations (default users: admin/admin123, user/user123)")
-    print("  - Admin role required for delete, import_csv, and export_csv")
+    print("  - Admin role required for delete, upload, import_csv, and export_csv")
     print("  - Use quotes for values with spaces, e.g., \"{\\\"Name\\\": \\\"Alice\\\", \\\"Age\\\": 15, \\\"Grade\\\": 10, \\\"Class\\\": \\\"A\\\", \\\"Subjects\\\": [\\\"Math\\\", \\\"Science\\\"]}\")")
     print("  - CSV format: key,value (value can be JSON, number, or string)")
     print("  - Type 'help' to display this message again.")
@@ -919,6 +1005,10 @@ def main():
                 key = parts[1]
                 value = " ".join(parts[2:])
                 print(db.create(key, value))
+            elif command == "upload" and len(parts) == 3:
+                print(db.upload(parts[1], parts[2]))
+            elif command == "get_file" and len(parts) == 2:
+                print(db.get_file(parts[1]))
             elif command == "read" and len(parts) == 2:
                 print(db.read(parts[1]))
             elif command == "update" and len(parts) >= 3:
@@ -967,6 +1057,8 @@ def main():
                 print("  - logout                     : Log out from the database (e.g., logout)")
                 print("\nData Operations:")
                 print("  - create <key> <value>    : Insert a new key-value pair (e.g., create student001 \"{\\\"Name\\\": \\\"Alice\\\", \\\"Age\\\": 15, \\\"Grade\\\": 10, \\\"Class\\\": \\\"A\\\", \\\"Subjects\\\": [\\\"Math\\\", \\\"Science\\\"]}\")")
+                print("  - upload <key> <file_path> : Upload a file for a key (admin only, e.g., upload student001 photo.jpg)")
+                print("  - get_file <key>          : Retrieve/open the file for a key (e.g., get_file student001)")
                 print("  - read <key>              : Retrieve the value for a key (e.g., read student001)")
                 print("  - update <key> <value>    : Update the value for an existing key (e.g., update student001 \"{\\\"Name\\\": \\\"Alice\\\", \\\"Age\\\": 16, \\\"Grade\\\": 10, \\\"Class\\\": \\\"A\\\", \\\"Subjects\\\": [\\\"Math\\\", \\\"Science\\\"]}\")")
                 print("  - delete <key>            : Delete a key-value pair (admin only, e.g., delete student001)")
@@ -998,7 +1090,7 @@ def main():
                 print("  - exit                    : Exit the database CLI")
                 print("\nNotes:")
                 print("  - Must log in to perform operations (default users: admin/admin123, user/user123)")
-                print("  - Admin role required for delete, import_csv, and export_csv")
+                print("  - Admin role required for delete, upload, import_csv, and export_csv")
                 print("  - Use quotes for values with spaces, e.g., \"{\\\"Name\\\": \\\"Alice\\\", \\\"Age\\\": 15, \\\"Grade\\\": 10, \\\"Class\\\": \\\"A\\\", \\\"Subjects\\\": [\\\"Math\\\", \\\"Science\\\"]}\")")
                 print("  - CSV format: key,value (value can be JSON, number, or string)")
                 print("  - Type 'help' to display this message again.")
