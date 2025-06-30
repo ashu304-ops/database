@@ -8,6 +8,7 @@ import time
 import re
 import shutil
 import subprocess
+import gzip
 from collections import defaultdict
 from threading import Timer
 from contextlib import contextmanager
@@ -21,7 +22,7 @@ class BTreeNode:
         self.leaf = leaf
 
 class SimpleDB:
-    def __init__(self, db_file='database.json', files_dir='files'):
+    def __init__(self, db_file='database.json.gz', files_dir='files'):
         self.db_file = Path(db_file)
         self.files_dir = Path(files_dir)
         self.db_file.parent.mkdir(parents=True, exist_ok=True)
@@ -94,18 +95,32 @@ class SimpleDB:
             raise TimeoutError("Timeout acquiring lock for load")
         try:
             print("Debug: Entering load method")
+            # Check for legacy database.json
+            legacy_db_file = self.db_file.with_suffix('.json')
+            if legacy_db_file.exists():
+                print(f"Debug: Found legacy {legacy_db_file}, converting to {self.db_file}")
+                with open(legacy_db_file, 'r') as f:
+                    self.store = json.load(f)
+                # Convert single file_path to file_paths
+                for key, value in self.store.items():
+                    if isinstance(value, dict) and "file_path" in value:
+                        value["file_paths"] = [{"path": value["file_path"], "original_ext": os.path.splitext(value["file_path"])[1], "size": os.path.getsize(value["file_path"]), "original_size": os.path.getsize(value["file_path"]), "uploaded": time.strftime("%Y-%m-%dT%H:%M:%S"), "mime": self._get_mime_type(value["file_path"])}]
+                        del value["file_path"]
+                self.save()
+                os.remove(legacy_db_file)
+                print(f"Debug: Converted and removed {legacy_db_file}")
             if self.db_file.exists():
                 try:
                     with self.timeout(5):
-                        print("Debug: Opening database file for reading")
-                        with open(self.db_file, 'r') as f:
-                            print("Debug: Reading database file")
+                        print("Debug: Opening compressed database file for reading")
+                        with gzip.open(self.db_file, 'rt', encoding='utf-8') as f:
+                            print("Debug: Reading compressed database file")
                             self.store = json.load(f)
                             if not isinstance(self.store, dict):
                                 raise ValueError("Invalid database format")
                     print("Debug: Rebuilding indices")
                     self.rebuild_indices()
-                    print(f"Loaded database from {self.db_file}")
+                    print(f"Loaded compressed database from {self.db_file}")
                 except (json.JSONDecodeError, ValueError):
                     print(f"Error: {self.db_file} is corrupted. Starting with an empty database.")
                     self.store = {}
@@ -140,21 +155,21 @@ class SimpleDB:
                     backup_file = str(self.db_file) + '.bak'
                     with self.timeout(5):
                         print("Debug: Creating backup")
-                        with open(self.db_file, 'r') as src, open(backup_file, 'w') as dst:
+                        with open(self.db_file, 'rb') as src, open(backup_file, 'wb') as dst:
                             dst.write(src.read())
                             print("Debug: Backup created")
                 with self.timeout(5):
                     print("Debug: Creating temporary file")
-                    with tempfile.NamedTemporaryFile('w', delete=False, dir=db_dir) as temp_file:
-                        print("Debug: Writing to temporary file")
-                        json.dump(self.store, temp_file, indent=2)
+                    with tempfile.NamedTemporaryFile('wb', delete=False, dir=db_dir, suffix='.gz') as temp_file:
+                        print("Debug: Writing to compressed temporary file")
+                        with gzip.GzipFile(fileobj=temp_file, mode='wb') as gz:
+                            gz.write(json.dumps(self.store, indent=2).encode('utf-8'))
                         temp_file.flush()
-                        print("Debug: Flushing temporary file")
                         os.fsync(temp_file.fileno())
                         temp_name = temp_file.name
                     print(f"Debug: Renaming {temp_name} to {self.db_file}")
                     os.replace(temp_name, self.db_file)
-                    print(f"Saved database to {self.db_file}")
+                    print(f"Saved compressed database to {self.db_file}")
                 print("Debug: File write completed")
             except TimeoutError:
                 print(f"Error: Timeout while writing to {self.db_file}")
@@ -167,261 +182,9 @@ class SimpleDB:
             print("Debug: Releasing lock for save")
             self.lock.release()
 
-    def rebuild_indices(self):
-        print("Debug: Attempting to acquire lock for rebuild_indices")
-        if not self.lock.acquire(timeout=5):
-            print("Error: Timeout acquiring lock for rebuild_indices")
-            raise TimeoutError("Timeout acquiring lock for rebuild_indices")
-        try:
-            print("Debug: Rebuilding indices")
-            self.value_index = defaultdict(list)
-            self.inverted_index = defaultdict(list)
-            self.btree_root = BTreeNode()
-            numeric_pairs = []
-            try:
-                with self.timeout(30):
-                    for key, value in self.store.items():
-                        print(f"Debug: Processing key '{key}' with value {value}")
-                        try:
-                            value_key = json.dumps(value, sort_keys=True)
-                            self.value_index[value_key].append(key)
-                            print(f"Debug: Added {key} to value_index with value_key {value_key}")
-                            value_str = str(value).lower()
-                            print(f"Debug: Tokenized string for '{key}': {value_str}")
-                            words = set(re.findall(r'\b\w+\b', value_str))
-                            print(f"Debug: Extracted words for '{key}': {words}")
-                            for word in words:
-                                if word:
-                                    self.inverted_index[word].append(key)
-                                    print(f"Debug: Added {key} to inverted_index for word '{word}'")
-                            if isinstance(value, (int, float)):
-                                numeric_pairs.append((key, value))
-                                print(f"Debug: Queued {key}:{value} for B-tree")
-                        except Exception as e:
-                            print(f"Error processing key '{key}': {e}")
-                            continue
-                    if numeric_pairs:
-                        print("Debug: Performing batch B-tree insertion")
-                        self.btree_root.keys.extend(numeric_pairs)
-                        self.btree_root.keys.sort(key=lambda x: x[1])
-                        print(f"Debug: Inserted {len(numeric_pairs)} numeric pairs into B-tree")
-                print("Debug: Indices rebuilt")
-            except TimeoutError:
-                print("Error: Timeout while rebuilding indices")
-                raise
-            except Exception as e:
-                print(f"Error rebuilding indices: {e}")
-                raise
-        finally:
-            print("Debug: Releasing lock for rebuild_indices")
-            self.lock.release()
-
-    def btree_insert(self, key, value):
-        print("Debug: Attempting to acquire lock for btree_insert")
-        if not self.lock.acquire(timeout=5):
-            print("Error: Timeout acquiring lock for btree_insert")
-            raise TimeoutError("Timeout acquiring lock for btree_insert")
-        try:
-            print(f"Debug: Inserting {key}:{value} into B-tree")
-            node = self.btree_root
-            node.keys.append((key, value))
-            node.keys.sort(key=lambda x: x[1])
-            print(f"Debug: Inserted {key}:{value} into B-tree")
-        finally:
-            print("Debug: Releasing lock for btree_insert")
-            self.lock.release()
-
-    def btree_range_query(self, operator, query_value):
-        print("Debug: Attempting to acquire lock for btree_range_query")
-        if not self.lock.acquire(timeout=5):
-            print("Error: Timeout acquiring lock for btree_range_query")
-            raise TimeoutError("Timeout acquiring lock for btree_range_query")
-        try:
-            print(f"Debug: Performing B-tree range query with {operator} {query_value}")
-            results = []
-            for key, value in self.btree_root.keys:
-                if (operator == ">" and value > query_value) or \
-                   (operator == "<" and value < query_value):
-                    results.append(key)
-            print(f"Debug: Range query results: {results}")
-            return results
-        finally:
-            print("Debug: Releasing lock for btree_range_query")
-            self.lock.release()
-
-    def begin(self):
-        print("Debug: Attempting to acquire lock for begin")
-        if not self.lock.acquire(timeout=5):
-            print("Error: Timeout acquiring lock for begin")
-            raise TimeoutError("Timeout acquiring lock for begin")
-        try:
-            print("Debug: Starting transaction")
-            if not self.current_user:
-                return "Error: Must be logged in to start a transaction"
-            if self.transaction_active:
-                return "Error: Transaction already in progress."
-            self.transaction_active = True
-            self.transaction_log = []
-            print("Debug: Transaction started")
-            return "Transaction started."
-        finally:
-            print("Debug: Releasing lock for begin")
-            self.lock.release()
-
-    def commit(self):
-        print("Debug: Attempting to acquire lock for commit")
-        if not self.lock.acquire(timeout=5):
-            print("Error: Timeout acquiring lock for commit")
-            raise TimeoutError("Timeout acquiring lock for commit")
-        try:
-            print("Debug: Committing transaction")
-            if not self.current_user:
-                return "Error: Must be logged in to commit a transaction"
-            if not self.transaction_active:
-                return "Error: No transaction in progress."
-            try:
-                print("Debug: Calling save method for commit")
-                self.save()
-                self.transaction_log = []
-                self.transaction_active = False
-                print("Debug: Transaction committed")
-                return "Transaction committed."
-            except Exception as e:
-                print(f"Error during commit: {e}")
-                return f"Error committing transaction: {e}"
-        finally:
-            print("Debug: Releasing lock for commit")
-            self.lock.release()
-
-    def rollback(self):
-        print("Debug: Attempting to acquire lock for rollback")
-        if not self.lock.acquire(timeout=5):
-            print("Error: Timeout acquiring lock for rollback")
-            raise TimeoutError("Timeout acquiring lock for rollback")
-        try:
-            print("Debug: Rolling back transaction")
-            if not self.current_user:
-                return "Error: Must be logged in to rollback a transaction"
-            if not self.transaction_active:
-                return "Error: No transaction in progress."
-            try:
-                for op, key, old_value in self.transaction_log:
-                    if op == "create":
-                        if key in self.store:
-                            value = self.store[key]
-                            if isinstance(value, dict) and "file_path" in value and os.path.exists(value["file_path"]):
-                                os.remove(value["file_path"])
-                            del self.store[key]
-                            value_key = json.dumps(old_value, sort_keys=True) if old_value is not None else None
-                            if value_key and key in self.value_index[value_key]:
-                                self.value_index[value_key].remove(key)
-                                if not self.value_index[value_key]:
-                                    del self.value_index[value_key]
-                            value_str = str(old_value).lower() if old_value else ""
-                            words = set(re.findall(r'\b\w+\b', value_str))
-                            for word in words:
-                                if word and key in self.inverted_index[word]:
-                                    self.inverted_index[word].remove(key)
-                                    if not self.inverted_index[word]:
-                                        del self.inverted_index[word]
-                            self.btree_root.keys = [(k, v) for k, v in self.btree_root.keys if k != key]
-                    elif op == "update":
-                        self.store[key] = old_value
-                        self.rebuild_indices()
-                    elif op == "delete":
-                        self.store[key] = old_value
-                        self.rebuild_indices()
-                    elif op == "upload":
-                        if key in self.store and isinstance(self.store[key], dict) and "file_path" in self.store[key]:
-                            if os.path.exists(self.store[key]["file_path"]):
-                                os.remove(self.store[key]["file_path"])
-                            del self.store[key]["file_path"]
-                            self.rebuild_indices()
-                self.transaction_log = []
-                self.transaction_active = False
-                print("Debug: Transaction rolled back")
-                return "Transaction rolled back."
-            except Exception as e:
-                print(f"Error during rollback: {e}")
-                return f"Error rolling back transaction: {e}"
-        finally:
-            print("Debug: Releasing lock for rollback")
-            self.lock.release()
-
-    def import_csv(self, csv_file):
-        print("Debug: Attempting to acquire lock for import_csv")
-        if not self.lock.acquire(timeout=5):
-            print("Error: Timeout acquiring lock for import_csv")
-            raise TimeoutError("Timeout acquiring lock for import_csv")
-        try:
-            print(f"Debug: Importing from CSV file: {csv_file}")
-            if not self.current_user:
-                return "Error: Must be logged in to import CSV"
-            if self.current_role != "admin":
-                return "Error: Import CSV operation requires admin privileges"
-            start_time = time.time()
-            if not os.path.exists(csv_file):
-                return f"Error: CSV file '{csv_file}' not found."
-            try:
-                with self.timeout(5):
-                    print("Debug: Opening CSV file for reading")
-                    with open(csv_file, 'r', newline='') as f:
-                        reader = csv.DictReader(f)
-                        if 'key' not in reader.fieldnames or 'value' not in reader.fieldnames:
-                            return "Error: CSV must have 'key' and 'value' columns."
-                        batch_count = 0
-                        for row in reader:
-                            key = row['key']
-                            value = row['value']
-                            print(f"Debug: Importing key '{key}' with value '{value}'")
-                            result = self.create(key, value)
-                            print(result)
-                            batch_count += 1
-                            if batch_count % 100 == 0 and not self.transaction_active:
-                                print("Debug: Saving batch")
-                                self.save()
-                        if not self.transaction_active:
-                            print("Debug: Saving final batch")
-                            self.save()
-                print(f"Debug: Completed CSV import from {csv_file} in {time.time() - start_time:.2f} seconds")
-                return f"Imported data from {csv_file}"
-            except TimeoutError:
-                return f"Error: Timeout while reading {csv_file}"
-            except Exception as e:
-                return f"Error importing CSV: {e}"
-        finally:
-            print("Debug: Releasing lock for import_csv")
-            self.lock.release()
-
-    def export_csv(self, csv_file):
-        print("Debug: Attempting to acquire lock for export_csv")
-        if not self.lock.acquire(timeout=5):
-            print("Error: Timeout acquiring lock for export_csv")
-            raise TimeoutError("Timeout acquiring lock for export_csv")
-        try:
-            print(f"Debug: Exporting to CSV file: {csv_file}")
-            if not self.current_user:
-                return "Error: Must be logged in to export CSV"
-            if self.current_role != "admin":
-                return "Error: Export CSV operation requires admin privileges"
-            start_time = time.time()
-            try:
-                with self.timeout(5):
-                    print("Debug: Opening CSV file for writing")
-                    with open(csv_file, 'w', newline='') as f:
-                        writer = csv.writer(f)
-                        writer.writerow(['key', 'value'])
-                        for key, value in self.store.items():
-                            writer.writerow([key, json.dumps(value)])
-                print(f"Debug: Completed CSV export to {csv_file} in {time.time() - start_time:.2f} seconds")
-                return f"Exported data to {csv_file}"
-            except TimeoutError:
-                return f"Error: Timeout while writing {csv_file}"
-            except Exception as e:
-                return f"Error exporting CSV: {e}"
-        finally:
-            print("Debug: Releasing lock for export_csv")
-            self.lock.release()
+    def _get_mime_type(self, file_path):
+        ext = os.path.splitext(file_path)[1].lower()
+        return {'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png', 'gif': 'image/gif', 'pdf': 'application/pdf', 'doc': 'application/msword', 'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'}.get(ext[1:], 'application/octet-stream')
 
     def upload(self, key, file_path):
         print("Debug: Attempting to acquire lock for upload")
@@ -443,23 +206,35 @@ class SimpleDB:
             file_size = os.path.getsize(file_path)
             if file_size > 10 * 1024 * 1024:  # 10MB limit
                 return "Error: File size exceeds 10MB limit"
-            dest_filename = f"{key}_{os.path.basename(file_path)}"
+            dest_filename = f"{key}_{os.path.basename(file_path)}.gz"
             dest_path = self.files_dir / dest_filename
-            shutil.copy(file_path, dest_path)
+            with open(file_path, 'rb') as src, gzip.open(dest_path, 'wb') as dst:
+                shutil.copyfileobj(src, dst)
+            compressed_size = os.path.getsize(dest_path)
+            file_metadata = {
+                "path": str(dest_path),
+                "original_ext": file_ext,
+                "size": compressed_size,
+                "original_size": file_size,
+                "uploaded": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "mime": self._get_mime_type(file_path)
+            }
+            if "file_paths" not in self.store[key]:
+                self.store[key]["file_paths"] = []
+            self.store[key]["file_paths"].append(file_metadata)
             if self.transaction_active:
                 self.transaction_log.append(("upload", key, None))
                 print(f"Debug: Added upload operation to transaction log for {key}")
-            self.store[key]["file_path"] = str(dest_path)
             if not self.transaction_active:
                 print("Debug: Calling save method")
                 self.save()
-            print(f"Debug: Uploaded file for {key}: {dest_path}")
-            return f"Uploaded file for {key}: {dest_path}"
+            print(f"Debug: Uploaded compressed file for {key}: {dest_path}")
+            return f"Uploaded compressed file for {key}: {dest_path} (Original size: {file_size} bytes, Compressed size: {compressed_size} bytes)"
         finally:
             print("Debug: Releasing lock for upload")
             self.lock.release()
 
-    def get_file(self, key):
+    def get_file(self, key, index=None):
         print("Debug: Attempting to acquire lock for get_file")
         if not self.lock.acquire(timeout=5):
             print("Error: Timeout acquiring lock for get_file")
@@ -470,21 +245,203 @@ class SimpleDB:
                 return "Error: Must be logged in to access files"
             if key not in self.store:
                 return f"Error: Key '{key}' not found."
-            if "file_path" not in self.store[key]:
-                return f"Error: No file associated with key '{key}'."
-            file_path = self.store[key]["file_path"]
+            if "file_paths" not in self.store[key] or not self.store[key]["file_paths"]:
+                return f"Error: No files associated with key '{key}'."
+            file_paths = self.store[key]["file_paths"]
+            if index is not None:
+                try:
+                    index = int(index)
+                    if index < 0 or index >= len(file_paths):
+                        return f"Error: Invalid file index {index}. Available: 0 to {len(file_paths)-1}"
+                    file_metadata = file_paths[index]
+                    file_path = file_metadata["path"]
+                    original_ext = file_metadata["original_ext"]
+                    metadata_str = f"Size: {file_metadata['size']} bytes, Original size: {file_metadata['original_size']} bytes, Uploaded: {file_metadata['uploaded']}, MIME: {file_metadata['mime']}"
+                except ValueError:
+                    return "Error: Index must be an integer"
+            else:
+                return "\n".join(f"[{i}] {f['path']} (Size: {f['size']} bytes, Original size: {f['original_size']} bytes, Uploaded: {f['uploaded']}, MIME: {f['mime']})" for i, f in enumerate(file_paths))
             if not os.path.exists(file_path):
                 return f"Error: File '{file_path}' not found on disk."
+            temp_dir = tempfile.gettempdir()
+            temp_filename = f"{key}_decompressed{original_ext}"
+            temp_path = os.path.join(temp_dir, temp_filename)
             try:
-                if os.name == 'nt':  # Windows
-                    subprocess.run(['start', '', file_path], shell=True, check=True)
-                elif os.name == 'posix':  # Linux/macOS
-                    subprocess.run(['xdg-open', file_path], check=True)
-                return f"Opened file: {file_path}"
+                with gzip.open(file_path, 'rb') as src, open(temp_path, 'wb') as dst:
+                    shutil.copyfileobj(src, dst)
+                if os.name == 'nt':
+                    subprocess.run(['start', '', temp_path], shell=True, check=True)
+                elif os.name == 'posix':
+                    viewers = [('xdg-open', ['xdg-open', temp_path]), ('eog', ['eog', temp_path]), ('firefox', ['firefox', temp_path])]
+                    for viewer_name, viewer_cmd in viewers:
+                        if shutil.which(viewer_name):
+                            subprocess.run(viewer_cmd, check=True)
+                            return f"Opened file: {file_path} with {viewer_name} ({metadata_str})"
+                    return f"File path: {temp_path} (No viewer installed; install 'eog' or 'firefox' with 'sudo apt install eog firefox' or open manually) ({metadata_str})"
+                return f"Opened file: {temp_path} ({metadata_str})"
             except Exception as e:
-                return f"File path: {file_path} (Open manually due to error: {e})"
+                return f"File path: {temp_path} (Open manually due to error: {e}) ({metadata_str})"
+            finally:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
         finally:
             print("Debug: Releasing lock for get_file")
+            self.lock.release()
+
+    def download_file(self, key, index=None, dest_path=None):
+        print("Debug: Attempting to acquire lock for download_file")
+        if not self.lock.acquire(timeout=5):
+            print("Error: Timeout acquiring lock for download_file")
+            raise TimeoutError("Timeout acquiring lock for download_file")
+        try:
+            print(f"Debug: Downloading file for key '{key}'")
+            if not self.current_user:
+                return "Error: Must be logged in to download files"
+            if key not in self.store:
+                return f"Error: Key '{key}' not found."
+            if "file_paths" not in self.store[key] or not self.store[key]["file_paths"]:
+                return f"Error: No files associated with key '{key}'."
+            file_paths = self.store[key]["file_paths"]
+            if index is not None:
+                try:
+                    index = int(index)
+                    if index < 0 or index >= len(file_paths):
+                        return f"Error: Invalid file index {index}. Available: 0 to {len(file_paths)-1}"
+                    file_metadata = file_paths[index]
+                    file_path = file_metadata["path"]
+                    original_ext = file_metadata["original_ext"]
+                except ValueError:
+                    return "Error: Index must be an integer"
+            else:
+                if len(file_paths) > 1:
+                    return f"Error: Multiple files exist. Specify an index (0 to {len(file_paths)-1}): {', '.join(f['path'] for f in file_paths)}"
+                file_metadata = file_paths[0]
+                file_path = file_metadata["path"]
+                original_ext = file_metadata["original_ext"]
+            if not os.path.exists(file_path):
+                return f"Error: File '{file_path}' not found on disk."
+            if not dest_path:
+                dest_path = f"{key}_decompressed{original_ext}"
+            try:
+                with gzip.open(file_path, 'rb') as src, open(dest_path, 'wb') as dst:
+                    shutil.copyfileobj(src, dst)
+                return f"Downloaded decompressed file to: {dest_path}"
+            except Exception as e:
+                return f"Error downloading file: {e}"
+        finally:
+            print("Debug: Releasing lock for download_file")
+            self.lock.release()
+
+    def delete(self, key):
+        print("Debug: Attempting to acquire lock for delete")
+        if not self.lock.acquire(timeout=5):
+            print("Error: Timeout acquiring lock for delete")
+            raise TimeoutError("Timeout acquiring lock for delete")
+        try:
+            print(f"Debug: Attempting to delete key '{key}'")
+            if not self.current_user or self.current_role != "admin":
+                return "Error: Admin privileges required to delete"
+            if key not in self.store:
+                return f"Error: Key '{key}' not found."
+            value = deepcopy(self.store[key])
+            try:
+                if self.transaction_active:
+                    self.transaction_log.append(("delete", key, value))
+                    print(f"Debug: Added delete operation to transaction log for {key}")
+                if "file_paths" in value:
+                    for file_metadata in value["file_paths"]:
+                        if os.path.exists(file_metadata["path"]):
+                            os.remove(file_metadata["path"])
+                            print(f"Debug: Deleted compressed file {file_metadata['path']}")
+                del self.store[key]
+                print(f"Debug: Removed key '{key}' from store")
+                value_key = json.dumps(value, sort_keys=True)
+                if key in self.value_index[value_key]:
+                    self.value_index[value_key].remove(key)
+                    print(f"Debug: Removed key '{key}' from value_index for value {value_key}")
+                    if not self.value_index[value_key]:
+                        del self.value_index[value_key]
+                        print(f"Debug: Deleted empty value_index entry for {value_key}")
+                value_str = str(value).lower()
+                words = set(re.findall(r'\b\w+\b', value_str))
+                for word in words:
+                    if word and key in self.inverted_index[word]:
+                        self.inverted_index[word].remove(key)
+                        if not self.inverted_index[word]:
+                            del self.inverted_index[word]
+                            print(f"Debug: Deleted empty inverted_index entry for word '{word}'")
+                self.btree_root.keys = [(k, v) for k, v in self.btree_root.keys if k != key]
+                print(f"Debug: Removed {key} from B-tree")
+                if not self.transaction_active:
+                    print("Debug: Calling save method")
+                    self.save()
+                print(f"Debug: Completed deletion of key '{key}'")
+                return f"Deleted key: {key}"
+            except Exception as e:
+                print(f"Error during delete: {e}")
+                return f"Error deleting key '{key}': {e}"
+        finally:
+            print("Debug: Releasing lock for delete")
+            self.lock.release()
+
+    def rollback(self):
+        print("Debug: Attempting to acquire lock for rollback")
+        if not self.lock.acquire(timeout=5):
+            print("Error: Timeout acquiring lock for rollback")
+            raise TimeoutError("Timeout acquiring lock for rollback")
+        try:
+            print("Debug: Rolling back transaction")
+            if not self.current_user:
+                return "Error: Must be logged in to rollback a transaction"
+            if not self.transaction_active:
+                return "Error: No transaction in progress."
+            try:
+                for op, key, old_value in self.transaction_log:
+                    if op == "create":
+                        if key in self.store:
+                            value = self.store[key]
+                            if isinstance(value, dict) and "file_paths" in value:
+                                for file_metadata in value["file_paths"]:
+                                    if os.path.exists(file_metadata["path"]):
+                                        os.remove(file_metadata["path"])
+                            del self.store[key]
+                            value_key = json.dumps(old_value, sort_keys=True) if old_value is not None else None
+                            if value_key and key in self.value_index[value_key]:
+                                self.value_index[value_key].remove(key)
+                                if not self.value_index[value_key]:
+                                    del self.value_index[value_key]
+                            value_str = str(old_value).lower() if old_value else ""
+                            words = set(re.findall(r'\b\w+\b', value_str))
+                            for word in words:
+                                if word and key in self.inverted_index[word]:
+                                    self.inverted_index[word].remove(key)
+                                    if not self.inverted_index[word]:
+                                        del self.inverted_index[word]
+                            self.btree_root.keys = [(k, v) for k, v in self.btree_root.keys if k != key]
+                    elif op == "update":
+                        self.store[key] = old_value
+                        self.rebuild_indices()
+                    elif op == "delete":
+                        self.store[key] = old_value
+                        self.rebuild_indices()
+                    elif op == "upload":
+                        if key in self.store and isinstance(self.store[key], dict) and "file_paths" in self.store[key]:
+                            if self.store[key]["file_paths"]:
+                                last_file = self.store[key]["file_paths"].pop()
+                                if os.path.exists(last_file["path"]):
+                                    os.remove(last_file["path"])
+                                if not self.store[key]["file_paths"]:
+                                    del self.store[key]["file_paths"]
+                                self.rebuild_indices()
+                self.transaction_log = []
+                self.transaction_active = False
+                print("Debug: Transaction rolled back")
+                return "Transaction rolled back."
+            except Exception as e:
+                print(f"Error during rollback: {e}")
+                return f"Error rolling back transaction: {e}"
+        finally:
+            print("Debug: Releasing lock for rollback")
             self.lock.release()
 
     def parse_value(self, value):
@@ -586,8 +543,8 @@ class SimpleDB:
                 return f"Error: Key '{key}' not found."
             old_value = deepcopy(self.store[key])
             parsed_value = self.parse_value(value)
-            if isinstance(old_value, dict) and "file_path" in old_value:
-                parsed_value["file_path"] = old_value["file_path"]
+            if isinstance(old_value, dict) and "file_paths" in old_value:
+                parsed_value["file_paths"] = old_value["file_paths"]
             if self.transaction_active:
                 self.transaction_log.append(("update", key, old_value))
                 print(f"Debug: Added update operation to transaction log for {key}")
@@ -631,56 +588,86 @@ class SimpleDB:
             print("Debug: Releasing lock for update")
             self.lock.release()
 
-    def delete(self, key):
-        print("Debug: Attempting to acquire lock for delete")
+    def rebuild_indices(self):
+        print("Debug: Attempting to acquire lock for rebuild_indices")
         if not self.lock.acquire(timeout=5):
-            print("Error: Timeout acquiring lock for delete")
-            raise TimeoutError("Timeout acquiring lock for delete")
+            print("Error: Timeout acquiring lock for rebuild_indices")
+            raise TimeoutError("Timeout acquiring lock for rebuild_indices")
         try:
-            print(f"Debug: Attempting to delete key '{key}'")
-            if not self.current_user:
-                return "Error: Must be logged in to delete a key"
-            if self.current_role != "admin":
-                return "Error: Delete operation requires admin privileges"
-            if key not in self.store:
-                return f"Error: Key '{key}' not found."
-            value = deepcopy(self.store[key])
-            value_key = json.dumps(value, sort_keys=True)
+            print("Debug: Rebuilding indices")
+            self.value_index = defaultdict(list)
+            self.inverted_index = defaultdict(list)
+            self.btree_root = BTreeNode()
+            numeric_pairs = []
             try:
-                if self.transaction_active:
-                    self.transaction_log.append(("delete", key, value))
-                    print(f"Debug: Added delete operation to transaction log for {key}")
-                if isinstance(value, dict) and "file_path" in value and os.path.exists(value["file_path"]):
-                    os.remove(value["file_path"])
-                    print(f"Debug: Deleted file {value['file_path']}")
-                del self.store[key]
-                print(f"Debug: Removed key '{key}' from store")
-                if key in self.value_index[value_key]:
-                    self.value_index[value_key].remove(key)
-                    print(f"Debug: Removed key '{key}' from value_index for value {value_key}")
-                    if not self.value_index[value_key]:
-                        del self.value_index[value_key]
-                        print(f"Debug: Deleted empty value_index entry for {value_key}")
-                value_str = str(value).lower()
-                words = set(re.findall(r'\b\w+\b', value_str))
-                for word in words:
-                    if word and key in self.inverted_index[word]:
-                        self.inverted_index[word].remove(key)
-                        if not self.inverted_index[word]:
-                            del self.inverted_index[word]
-                            print(f"Debug: Deleted empty inverted_index entry for word '{word}'")
-                self.btree_root.keys = [(k, v) for k, v in self.btree_root.keys if k != key]
-                print(f"Debug: Removed {key} from B-tree")
-                if not self.transaction_active:
-                    print("Debug: Calling save method")
-                    self.save()
-                print(f"Debug: Completed deletion of key '{key}'")
-                return f"Deleted key: {key}"
+                with self.timeout(30):
+                    for key, value in self.store.items():
+                        print(f"Debug: Processing key '{key}' with value {value}")
+                        try:
+                            value_key = json.dumps(value, sort_keys=True)
+                            self.value_index[value_key].append(key)
+                            print(f"Debug: Added {key} to value_index with value_key {value_key}")
+                            value_str = str(value).lower()
+                            print(f"Debug: Tokenized string for '{key}': {value_str}")
+                            words = set(re.findall(r'\b\w+\b', value_str))
+                            print(f"Debug: Extracted words for '{key}': {words}")
+                            for word in words:
+                                if word:
+                                    self.inverted_index[word].append(key)
+                                    print(f"Debug: Added {key} to inverted_index for word '{word}'")
+                            if isinstance(value, (int, float)):
+                                numeric_pairs.append((key, value))
+                                print(f"Debug: Queued {key}:{value} for B-tree")
+                        except Exception as e:
+                            print(f"Error processing key '{key}': {e}")
+                            continue
+                    if numeric_pairs:
+                        print("Debug: Performing batch B-tree insertion")
+                        self.btree_root.keys.extend(numeric_pairs)
+                        self.btree_root.keys.sort(key=lambda x: x[1])
+                        print(f"Debug: Inserted {len(numeric_pairs)} numeric pairs into B-tree")
+                print("Debug: Indices rebuilt")
+            except TimeoutError:
+                print("Error: Timeout while rebuilding indices")
+                raise
             except Exception as e:
-                print(f"Error during delete: {e}")
-                return f"Error deleting key '{key}': {e}"
+                print(f"Error rebuilding indices: {e}")
+                raise
         finally:
-            print("Debug: Releasing lock for delete")
+            print("Debug: Releasing lock for rebuild_indices")
+            self.lock.release()
+
+    def btree_insert(self, key, value):
+        print("Debug: Attempting to acquire lock for btree_insert")
+        if not self.lock.acquire(timeout=5):
+            print("Error: Timeout acquiring lock for btree_insert")
+            raise TimeoutError("Timeout acquiring lock for btree_insert")
+        try:
+            print(f"Debug: Inserting {key}:{value} into B-tree")
+            node = self.btree_root
+            node.keys.append((key, value))
+            node.keys.sort(key=lambda x: x[1])
+            print(f"Debug: Inserted {key}:{value} into B-tree")
+        finally:
+            print("Debug: Releasing lock for btree_insert")
+            self.lock.release()
+
+    def btree_range_query(self, operator, query_value):
+        print("Debug: Attempting to acquire lock for btree_range_query")
+        if not self.lock.acquire(timeout=5):
+            print("Error: Timeout acquiring lock for btree_range_query")
+            raise TimeoutError("Timeout acquiring lock for btree_range_query")
+        try:
+            print(f"Debug: Performing B-tree range query with {operator} {query_value}")
+            results = []
+            for key, value in self.btree_root.keys:
+                if (operator == ">" and value > query_value) or \
+                   (operator == "<" and value < query_value):
+                    results.append(key)
+            print(f"Debug: Range query results: {results}")
+            return results
+        finally:
+            print("Debug: Releasing lock for btree_range_query")
             self.lock.release()
 
     def get_sort_key(self, key, sort_field):
@@ -759,7 +746,7 @@ class SimpleDB:
                     print(f"Debug: Inverted index for query terms: {[(word, self.inverted_index[word]) for word in words if word in self.inverted_index]}")
                     if not result_sets:
                         return "No keys found with the specified terms."
-                    results = list(set.intersection(*result_sets))  # Convert set to list for sorting
+                    results = list(set.intersection(*result_sets))
                     print(f"Debug: Fulltext query results: {results}")
                 else:
                     return "Invalid operator"
@@ -926,177 +913,188 @@ class SimpleDB:
             print("Debug: Releasing lock for list_all")
             self.lock.release()
 
-def main():
-    db = SimpleDB()
-    print("Simple Key-Value Database")
-    print("=========================")
-    print("Available Commands:")
-    print("\nAuthentication:")
-    print("  - login <username> <password> : Log in to the database (e.g., login admin admin123)")
-    print("  - logout                     : Log out from the database (e.g., logout)")
-    print("\nData Operations:")
-    print("  - create <key> <value>    : Insert a new key-value pair (e.g., create student001 \"{\\\"Name\\\": \\\"Alice\\\", \\\"Age\\\": 15, \\\"Grade\\\": 10, \\\"Class\\\": \\\"A\\\", \\\"Subjects\\\": [\\\"Math\\\", \\\"Science\\\"]}\")")
-    print("  - upload <key> <file_path> : Upload a file for a key (admin only, e.g., upload student001 photo.jpg)")
-    print("  - get_file <key>          : Retrieve/open the file for a key (e.g., get_file student001)")
-    print("  - read <key>              : Retrieve the value for a key (e.g., read student001)")
-    print("  - update <key> <value>    : Update the value for an existing key (e.g., update student001 \"{\\\"Name\\\": \\\"Alice\\\", \\\"Age\\\": 16, \\\"Grade\\\": 10, \\\"Class\\\": \\\"A\\\", \\\"Subjects\\\": [\\\"Math\\\", \\\"Science\\\"]}\")")
-    print("  - delete <key>            : Delete a key-value pair (admin only, e.g., delete student001)")
-    print("  - list                    : List all key-value pairs (e.g., list)")
-    print("\nQuery Operations:")
-    print("  - find = <value> [sortby <field>] [limit <n>] : Find keys with exact value match (e.g., find = \"{\\\"Name\\\": \\\"Alice\\\"}\" sortby Age limit 5)")
-    print("  - find > <value> [sortby <field>] [limit <n>] : Find keys with numeric values greater than specified (e.g., find > 15 sortby Age limit 5)")
-    print("  - find < <value> [sortby <field>] [limit <n>] : Find keys with numeric values less than specified (e.g., find < 20 sortby Age limit 5)")
-    print("  - find contains <value> [sortby <field>] [limit <n>] : Find keys with values containing substring (e.g., find contains Math sortby Age limit 5)")
-    print("  - find fulltext <value> [sortby <field>] [limit <n>] : Find keys with values containing all specified terms (e.g., find fulltext \"Math Science\" sortby Age limit 5)")
-    print("  - find <field> = <value> [sortby <field>] [limit <n>] : Find keys with dictionary field matching value (e.g., find Class = A sortby Age limit 5)")
-    print("  - join <key1> <key2> [field] : Join two keys by value or field (e.g., join student001 student002 Class)")
-    print("\nAggregation Operations:")
-    print("  - max <key>               : Get maximum value for a key (number or list, e.g., max student001)")
-    print("  - min <key>               : Get minimum value for a key (number or list, e.g., min student001)")
-    print("  - sum <key>               : Get sum of values for a key (number or list, e.g., sum student001)")
-    print("  - avg <key>               : Get average of values for a key (number or list, e.g., avg student001)")
-    print("\nData Import/Export:")
-    print("  - import_csv <file>       : Import key-value pairs from CSV (admin only, e.g., import_csv students.csv)")
-    print("  - export_csv <file>       : Export key-value pairs to CSV (admin only, e.g., export_csv output.csv)")
-    print("\nTransaction Management:")
-    print("  - begin                   : Start a transaction (e.g., begin)")
-    print("  - commit                  : Commit the current transaction (e.g., commit)")
-    print("  - rollback                : Roll back the current transaction (e.g., rollback)")
-    print("\nDebugging:")
-    print("  - inspect_index [word]    : Inspect the inverted index for a word or all words (e.g., inspect_index math)")
-    print("\nOther Commands:")
-    print("  - help                    : Display this help message")
-    print("  - exit                    : Exit the database CLI")
-    print("\nNotes:")
-    print("  - Must log in to perform operations (default users: admin/admin123, user/user123)")
-    print("  - Admin role required for delete, upload, import_csv, and export_csv")
-    print("  - Use quotes for values with spaces, e.g., \"{\\\"Name\\\": \\\"Alice\\\", \\\"Age\\\": 15, \\\"Grade\\\": 10, \\\"Class\\\": \\\"A\\\", \\\"Subjects\\\": [\\\"Math\\\", \\\"Science\\\"]}\")")
-    print("  - CSV format: key,value (value can be JSON, number, or string)")
-    print("  - Type 'help' to display this message again.")
-    print("=========================")
+    def main(self):
+        print("Simple Key-Value Database")
+        print("=========================")
+        print("Available Commands:")
+        print("\nAuthentication:")
+        print("  - login <username> <password> : Log in to the database (e.g., login admin admin123)")
+        print("  - logout                     : Log out from the database (e.g., logout)")
+        print("\nData Operations:")
+        print("  - create <key> <value>    : Insert a new key-value pair (e.g., create student001 \"{\\\"Name\\\": \\\"Alice\\\", \\\"Age\\\": 15, \\\"Grade\\\": 10, \\\"Class\\\": \\\"A\\\", \\\"Subjects\\\": [\\\"Math\\\", \\\"Science\\\"]}\")")
+        print("  - upload <key> <file_path> : Upload a compressed file for a key (admin only, e.g., upload student001 photo.jpg)")
+        print("  - get_file <key> [index]  : Retrieve/open a file for a key (e.g., get_file student001 0)")
+        print("  - download_file <key> [index] [dest_path] : Download a decompressed file (e.g., download_file student001 0 ~/Downloads/photo.jpg)")
+        print("  - read <key>              : Retrieve the value for a key (e.g., read student001)")
+        print("  - update <key> <value>    : Update the value for an existing key (e.g., update student001 \"{\\\"Name\\\": \\\"Alice\\\", \\\"Age\\\": 16, \\\"Grade\\\": 10, \\\"Class\\\": \\\"A\\\", \\\"Subjects\\\": [\\\"Math\\\", \\\"Science\\\"]}\")")
+        print("  - delete <key>            : Delete a key-value pair and associated files (admin only, e.g., delete student001)")
+        print("  - list                    : List all key-value pairs (e.g., list)")
+        print("\nQuery Operations:")
+        print("  - find = <value> [sortby <field>] [limit <n>] : Find keys with exact value match (e.g., find = \"{\\\"Name\\\": \\\"Alice\\\"}\" sortby Age limit 5)")
+        print("  - find > <value> [sortby <field>] [limit <n>] : Find keys with numeric values greater than specified (e.g., find > 15 sortby Age limit 5)")
+        print("  - find < <value> [sortby <field>] [limit <n>] : Find keys with numeric values less than specified (e.g., find < 20 sortby Age limit 5)")
+        print("  - find contains <value> [sortby <field>] [limit <n>] : Find keys with values containing substring (e.g., find contains Math sortby Age limit 5)")
+        print("  - find fulltext <value> [sortby <field>] [limit <n>] : Find keys with values containing all specified terms (e.g., find fulltext \"Math Science\" sortby Age limit 5)")
+        print("  - find <field> = <value> [sortby <field>] [limit <n>] : Find keys with dictionary field matching value (e.g., find Class = A sortby Age limit 5)")
+        print("  - join <key1> <key2> [field] : Join two keys by value or field (e.g., join student001 student002 Class)")
+        print("\nAggregation Operations:")
+        print("  - max <key>               : Get maximum value for a key (number or list, e.g., max student001)")
+        print("  - min <key>               : Get minimum value for a key (number or list, e.g., min student001)")
+        print("  - sum <key>               : Get sum of values for a key (number or list, e.g., sum student001)")
+        print("  - avg <key>               : Get average of values for a key (number or list, e.g., avg student001)")
+        print("\nData Import/Export:")
+        print("  - import_csv <file>       : Import key-value pairs from CSV (admin only, e.g., import_csv students.csv)")
+        print("  - export_csv <file>       : Export key-value pairs to CSV (admin only, e.g., export_csv output.csv)")
+        print("\nTransaction Management:")
+        print("  - begin                   : Start a transaction (e.g., begin)")
+        print("  - commit                  : Commit the current transaction (e.g., commit)")
+        print("  - rollback                : Roll back the current transaction (e.g., rollback)")
+        print("\nDebugging:")
+        print("  - inspect_index [word]    : Inspect the inverted index for a word or all words (e.g., inspect_index math)")
+        print("\nOther Commands:")
+        print("  - help                    : Display this help message")
+        print("  - exit                    : Exit the database CLI")
+        print("\nNotes:")
+        print("  - Database is stored compressed as database.json.gz")
+        print("  - Files are stored compressed in files/ (e.g., student001_photo.jpg.gz)")
+        print("  - Must log in to perform operations (default users: admin/admin123, user/user123)")
+        print("  - Admin role required for delete, upload, import_csv, and export_csv")
+        print("  - Use quotes for values with spaces, e.g., \"{\\\"Name\\\": \\\"Alice\\\", \\\"Age\\\": 15, \\\"Grade\\\": 10, \\\"Class\\\": \\\"A\\\", \\\"Subjects\\\": [\\\"Math\\\", \\\"Science\\\"]}\")")
+        print("  - CSV format: key,value (value can be JSON, number, or string)")
+        print("  - Type 'help' to display this message again.")
+        print("=========================")
 
-    while True:
-        try:
-            print("Debug: Waiting for input...")
-            input_str = input("> ")
-            print(f"Debug: Received input: {input_str}")
-            parts = shlex.split(input_str)
-            print(f"Debug: Parsed parts: {parts}")
-        except ValueError as e:
-            print(f"Error parsing input: {e}")
-            continue
-        except EOFError:
-            print("EOF received, exiting...")
-            break
-        except KeyboardInterrupt:
-            print("Keyboard interrupt received, exiting...")
-            break
-
-        if not parts:
-            continue
-
-        command = parts[0].lower()
-        try:
-            if command == "login" and len(parts) == 3:
-                print(db.login(parts[1], parts[2]))
-            elif command == "logout" and len(parts) == 1:
-                print(db.logout())
-            elif command == "create" and len(parts) >= 3:
-                key = parts[1]
-                value = " ".join(parts[2:])
-                print(db.create(key, value))
-            elif command == "upload" and len(parts) == 3:
-                print(db.upload(parts[1], parts[2]))
-            elif command == "get_file" and len(parts) == 2:
-                print(db.get_file(parts[1]))
-            elif command == "read" and len(parts) == 2:
-                print(db.read(parts[1]))
-            elif command == "update" and len(parts) >= 3:
-                key = parts[1]
-                value = " ".join(parts[2:])
-                print(db.update(key, value))
-            elif command == "delete" and len(parts) == 2:
-                print(db.delete(parts[1]))
-            elif command == "find" and len(parts) >= 2:
-                print(db.find(" ".join(parts[1:])))
-            elif command == "join" and len(parts) in (3, 4):
-                field = parts[3] if len(parts) == 4 else None
-                print(db.join(parts[1], parts[2], field))
-            elif command == "max" and len(parts) == 2:
-                print(db.max(parts[1]))
-            elif command == "min" and len(parts) == 2:
-                print(db.min(parts[1]))
-            elif command == "sum" and len(parts) == 2:
-                print(db.sum(parts[1]))
-            elif command == "avg" and len(parts) == 2:
-                print(db.avg(parts[1]))
-            elif command == "import_csv" and len(parts) == 2:
-                print(db.import_csv(parts[1]))
-            elif command == "export_csv" and len(parts) == 2:
-                print(db.export_csv(parts[1]))
-            elif command == "begin" and len(parts) == 1:
-                print(db.begin())
-            elif command == "commit" and len(parts) == 1:
-                print(db.commit())
-            elif command == "rollback" and len(parts) == 1:
-                print(db.rollback())
-            elif command == "list" and len(parts) == 1:
-                print(db.list_all())
-            elif command == "inspect_index" and len(parts) in (1, 2):
-                word = parts[1] if len(parts) == 2 else None
-                print(db.inspect_inverted_index(word))
-            elif command == "exit" and len(parts) == 1:
-                print("Exiting...")
+        while True:
+            try:
+                print("Debug: Waiting for input...")
+                input_str = input("> ")
+                print(f"Debug: Received input: {input_str}")
+                parts = shlex.split(input_str)
+                print(f"Debug: Parsed parts: {parts}")
+            except ValueError as e:
+                print(f"Error parsing input: {e}")
+                continue
+            except EOFError:
+                print("EOF received, exiting...")
                 break
-            elif command == "help" and len(parts) == 1:
-                print("Simple Key-Value Database")
-                print("=========================")
-                print("Available Commands:")
-                print("\nAuthentication:")
-                print("  - login <username> <password> : Log in to the database (e.g., login admin admin123)")
-                print("  - logout                     : Log out from the database (e.g., logout)")
-                print("\nData Operations:")
-                print("  - create <key> <value>    : Insert a new key-value pair (e.g., create student001 \"{\\\"Name\\\": \\\"Alice\\\", \\\"Age\\\": 15, \\\"Grade\\\": 10, \\\"Class\\\": \\\"A\\\", \\\"Subjects\\\": [\\\"Math\\\", \\\"Science\\\"]}\")")
-                print("  - upload <key> <file_path> : Upload a file for a key (admin only, e.g., upload student001 photo.jpg)")
-                print("  - get_file <key>          : Retrieve/open the file for a key (e.g., get_file student001)")
-                print("  - read <key>              : Retrieve the value for a key (e.g., read student001)")
-                print("  - update <key> <value>    : Update the value for an existing key (e.g., update student001 \"{\\\"Name\\\": \\\"Alice\\\", \\\"Age\\\": 16, \\\"Grade\\\": 10, \\\"Class\\\": \\\"A\\\", \\\"Subjects\\\": [\\\"Math\\\", \\\"Science\\\"]}\")")
-                print("  - delete <key>            : Delete a key-value pair (admin only, e.g., delete student001)")
-                print("  - list                    : List all key-value pairs (e.g., list)")
-                print("\nQuery Operations:")
-                print("  - find = <value> [sortby <field>] [limit <n>] : Find keys with exact value match (e.g., find = \"{\\\"Name\\\": \\\"Alice\\\"}\" sortby Age limit 5)")
-                print("  - find > <value> [sortby <field>] [limit <n>] : Find keys with numeric values greater than specified (e.g., find > 15 sortby Age limit 5)")
-                print("  - find < <value> [sortby <field>] [limit <n>] : Find keys with numeric values less than specified (e.g., find < 20 sortby Age limit 5)")
-                print("  - find contains <value> [sortby <field>] [limit <n>] : Find keys with values containing substring (e.g., find contains Math sortby Age limit 5)")
-                print("  - find fulltext <value> [sortby <field>] [limit <n>] : Find keys with values containing all specified terms (e.g., find fulltext \"Math Science\" sortby Age limit 5)")
-                print("  - find <field> = <value> [sortby <field>] [limit <n>] : Find keys with dictionary field matching value (e.g., find Class = A sortby Age limit 5)")
-                print("  - join <key1> <key2> [field] : Join two keys by value or field (e.g., join student001 student002 Class)")
-                print("\nAggregation Operations:")
-                print("  - max <key>               : Get maximum value for a key (number or list, e.g., max student001)")
-                print("  - min <key>               : Get minimum value for a key (number or list, e.g., min student001)")
-                print("  - sum <key>               : Get sum of values for a key (number or list, e.g., sum student001)")
-                print("  - avg <key>               : Get average of values for a key (number or list, e.g., avg student001)")
-                print("\nData Import/Export:")
-                print("  - import_csv <file>       : Import key-value pairs from CSV (admin only, e.g., import_csv students.csv)")
-                print("  - export_csv <file>       : Export key-value pairs to CSV (admin only, e.g., export_csv output.csv)")
-                print("\nTransaction Management:")
-                print("  - begin                   : Start a transaction (e.g., begin)")
-                print("  - commit                  : Commit the current transaction (e.g., commit)")
-                print("  - rollback                : Roll back the current transaction (e.g., rollback)")
-                print("\nDebugging:")
-                print("  - inspect_index [word]    : Inspect the inverted index for a word or all words (e.g., inspect_index math)")
-                print("\nOther Commands:")
-                print("  - help                    : Display this help message")
-                print("  - exit                    : Exit the database CLI")
-                print("\nNotes:")
-                print("  - Must log in to perform operations (default users: admin/admin123, user/user123)")
-                print("  - Admin role required for delete, upload, import_csv, and export_csv")
-                print("  - Use quotes for values with spaces, e.g., \"{\\\"Name\\\": \\\"Alice\\\", \\\"Age\\\": 15, \\\"Grade\\\": 10, \\\"Class\\\": \\\"A\\\", \\\"Subjects\\\": [\\\"Math\\\", \\\"Science\\\"]}\")")
-                print("  - CSV format: key,value (value can be JSON, number, or string)")
-                print("  - Type 'help' to display this message again.")
-                print("=========================")
-        except Exception as e:
-            print(f"Error in command processing: {e}")
+            except KeyboardInterrupt:
+                print("Keyboard interrupt received, exiting...")
+                break
+
+            if not parts:
+                continue
+
+            command = parts[0].lower()
+            try:
+                if command == "login" and len(parts) == 3:
+                    print(self.login(parts[1], parts[2]))
+                elif command == "logout" and len(parts) == 1:
+                    print(self.logout())
+                elif command == "create" and len(parts) >= 3:
+                    key = parts[1]
+                    value = " ".join(parts[2:])
+                    print(self.create(key, value))
+                elif command == "upload" and len(parts) == 3:
+                    print(self.upload(parts[1], parts[2]))
+                elif command == "get_file" and len(parts) in (2, 3):
+                    index = parts[2] if len(parts) == 3 else None
+                    print(self.get_file(parts[1], index))
+                elif command == "download_file" and len(parts) in (3, 4):
+                    index = parts[2] if len(parts) == 4 else None
+                    dest_path = parts[3] if len(parts) == 4 else None
+                    print(self.download_file(parts[1], index, dest_path))
+                elif command == "read" and len(parts) == 2:
+                    print(self.read(parts[1]))
+                elif command == "update" and len(parts) >= 3:
+                    key = parts[1]
+                    value = " ".join(parts[2:])
+                    print(self.update(key, value))
+                elif command == "delete" and len(parts) == 2:
+                    print(self.delete(parts[1]))
+                elif command == "find" and len(parts) >= 2:
+                    print(self.find(" ".join(parts[1:])))
+                elif command == "join" and len(parts) in (3, 4):
+                    field = parts[3] if len(parts) == 4 else None
+                    print(self.join(parts[1], parts[2], field))
+                elif command == "max" and len(parts) == 2:
+                    print(self.max(parts[1]))
+                elif command == "min" and len(parts) == 2:
+                    print(self.min(parts[1]))
+                elif command == "sum" and len(parts) == 2:
+                    print(self.sum(parts[1]))
+                elif command == "avg" and len(parts) == 2:
+                    print(self.avg(parts[1]))
+                elif command == "import_csv" and len(parts) == 2:
+                    print(self.import_csv(parts[1]))
+                elif command == "export_csv" and len(parts) == 2:
+                    print(self.export_csv(parts[1]))
+                elif command == "begin" and len(parts) == 1:
+                    print(self.begin())
+                elif command == "commit" and len(parts) == 1:
+                    print(self.commit())
+                elif command == "rollback" and len(parts) == 1:
+                    print(self.rollback())
+                elif command == "list" and len(parts) == 1:
+                    print(self.list_all())
+                elif command == "inspect_index" and len(parts) in (1, 2):
+                    word = parts[1] if len(parts) == 2 else None
+                    print(self.inspect_inverted_index(word))
+                elif command == "exit" and len(parts) == 1:
+                    print("Exiting...")
+                    break
+                elif command == "help" and len(parts) == 1:
+                    print("Simple Key-Value Database")
+                    print("=========================")
+                    print("Available Commands:")
+                    print("\nAuthentication:")
+                    print("  - login <username> <password> : Log in to the database (e.g., login admin admin123)")
+                    print("  - logout                     : Log out from the database (e.g., logout)")
+                    print("\nData Operations:")
+                    print("  - create <key> <value>    : Insert a new key-value pair (e.g., create student001 \"{\\\"Name\\\": \\\"Alice\\\", \\\"Age\\\": 15, \\\"Grade\\\": 10, \\\"Class\\\": \\\"A\\\", \\\"Subjects\\\": [\\\"Math\\\", \\\"Science\\\"]}\")")
+                    print("  - upload <key> <file_path> : Upload a compressed file for a key (admin only, e.g., upload student001 photo.jpg)")
+                    print("  - get_file <key> [index]  : Retrieve/open a file for a key (e.g., get_file student001 0)")
+                    print("  - download_file <key> [index] [dest_path] : Download a decompressed file (e.g., download_file student001 0 ~/Downloads/photo.jpg)")
+                    print("  - read <key>              : Retrieve the value for a key (e.g., read student001)")
+                    print("  - update <key> <value>    : Update the value for an existing key (e.g., update student001 \"{\\\"Name\\\": \\\"Alice\\\", \\\"Age\\\": 16, \\\"Grade\\\": 10, \\\"Class\\\": \\\"A\\\", \\\"Subjects\\\": [\\\"Math\\\", \\\"Science\\\"]}\")")
+                    print("  - delete <key>            : Delete a key-value pair and associated files (admin only, e.g., delete student001)")
+                    print("  - list                    : List all key-value pairs (e.g., list)")
+                    print("\nQuery Operations:")
+                    print("  - find = <value> [sortby <field>] [limit <n>] : Find keys with exact value match (e.g., find = \"{\\\"Name\\\": \\\"Alice\\\"}\" sortby Age limit 5)")
+                    print("  - find > <value> [sortby <field>] [limit <n>] : Find keys with numeric values greater than specified (e.g., find > 15 sortby Age limit 5)")
+                    print("  - find < <value> [sortby <field>] [limit <n>] : Find keys with numeric values less than specified (e.g., find < 20 sortby Age limit 5)")
+                    print("  - find contains <value> [sortby <field>] [limit <n>] : Find keys with values containing substring (e.g., find contains Math sortby Age limit 5)")
+                    print("  - find fulltext <value> [sortby <field>] [limit <n>] : Find keys with values containing all specified terms (e.g., find fulltext \"Math Science\" sortby Age limit 5)")
+                    print("  - find <field> = <value> [sortby <field>] [limit <n>] : Find keys with dictionary field matching value (e.g., find Class = A sortby Age limit 5)")
+                    print("  - join <key1> <key2> [field] : Join two keys by value or field (e.g., join student001 student002 Class)")
+                    print("\nAggregation Operations:")
+                    print("  - max <key>               : Get maximum value for a key (number or list, e.g., max student001)")
+                    print("  - min <key>               : Get minimum value for a key (number or list, e.g., min student001)")
+                    print("  - sum <key>               : Get sum of values for a key (number or list, e.g., sum student001)")
+                    print("  - avg <key>               : Get average of values for a key (number or list, e.g., avg student001)")
+                    print("\nData Import/Export:")
+                    print("  - import_csv <file>       : Import key-value pairs from CSV (admin only, e.g., import_csv students.csv)")
+                    print("  - export_csv <file>       : Export key-value pairs to CSV (admin only, e.g., export_csv output.csv)")
+                    print("\nTransaction Management:")
+                    print("  - begin                   : Start a transaction (e.g., begin)")
+                    print("  - commit                  : Commit the current transaction (e.g., commit)")
+                    print("  - rollback                : Roll back the current transaction (e.g., rollback)")
+                    print("\nDebugging:")
+                    print("  - inspect_index [word]    : Inspect the inverted index for a word or all words (e.g., inspect_index math)")
+                    print("\nOther Commands:")
+                    print("  - help                    : Display this help message")
+                    print("  - exit                    : Exit the database CLI")
+                    print("\nNotes:")
+                    print("  - Database is stored compressed as database.json.gz")
+                    print("  - Files are stored compressed in files/ (e.g., student001_photo.jpg.gz)")
+                    print("  - Must log in to perform operations (default users: admin/admin123, user/user123)")
+                    print("  - Admin role required for delete, upload, import_csv, and export_csv")
+                    print("  - Use quotes for values with spaces, e.g., \"{\\\"Name\\\": \\\"Alice\\\", \\\"Age\\\": 15, \\\"Grade\\\": 10, \\\"Class\\\": \\\"A\\\", \\\"Subjects\\\": [\\\"Math\\\", \\\"Science\\\"]}\")")
+                    print("  - CSV format: key,value (value can be JSON, number, or string)")
+                    print("  - Type 'help' to display this message again.")
+                    print("=========================")
+            except Exception as e:
+                print(f"Error in command processing: {e}")
 
 if __name__ == "__main__":
-    main()
+    db = SimpleDB()
+    db.main()
